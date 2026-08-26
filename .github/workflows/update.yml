@@ -22,7 +22,7 @@ jobs:
           python-version: '3.11'
 
       - name: 安裝需要的套件
-        run: pip install requests pandas lxml
+        run: pip install requests pandas lxml beautifulsoup4
 
       - name: 執行抓取與計算
         run: python taiex_indicators.py
