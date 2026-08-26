@@ -1,0 +1,36 @@
+name: 每日更新先行指標
+
+on:
+  schedule:
+    # UTC 07:30 = 台灣時間 15:30，週一到週五（台股收盤後）
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch: {}   # 允許在 GitHub 網頁上手動按「Run workflow」測試
+
+permissions:
+  contents: write   # 讓這個排程可以把新資料 commit 回倉庫
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取得倉庫程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝需要的套件
+        run: pip install requests pandas lxml
+
+      - name: 執行抓取與計算
+        run: python taiex_indicators.py
+
+      - name: 把新資料寫回倉庫
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add history.csv
+          git diff --cached --quiet || git commit -m "自動更新 $(date +'%Y-%m-%d')"
+          git push
