@@ -11,25 +11,27 @@
   2. 依照原始 Excel 檔的公式，計算出「先行指標」8 個欄位
   3. 把新的一列資料附加寫入 history.csv（若當天已存在則跳過，避免重複）
 
-已實際用 web_fetch 驗證過的部分（欄位順序正確）：
-  - futContractsDateExcel（三大法人期貨未平倉）
-  - largeTraderFutQryTbl（大額交易人前五/十大留倉）
-  - pcRatioExcel（選擇權 PCR）
-  - callsAndPutsDateExcel（三大法人選擇權），但發現一個重要限制：見下方。
+版本紀錄（依實際執行結果修正過）：
+  v1 第一次上線後，實測發現兩類問題：
+    1. TWSE 三大法人買賣超「外資」欄一律抓到 0：因為原本用「排除含
+       『自營商』字樣」來判斷，但正確項目全名是「外資及陸資(不含外資
+       自營商)」，字串裡本來就含有「自營商」，排除法誤判——已修正為
+       直接比對開頭文字。
+    2. 外資大小 / 前五大十大留倉 / 選PCR / 韭菜指數 抓到空值：因為
+       pandas.read_html 在期交所這種多層合併儲存格(rowspan/colspan)
+       的表格上常常抓錯欄位對齊——已改用 BeautifulSoup 手動展開合併
+       儲存格（parse_table_grid），不再依賴 pandas 的自動判斷。
 
-尚未實際驗證、風險較高的部分（收盤後請務必檢查結果是否合理）：
-  - TWSE 成交量 / 三大法人買賣超（改用 rwd JSON API，格式已確認存在，
-    但完整解析邏輯未逐欄核對）
-  - futDailyMarketExcel（大台/小台 每日行情，用來加總未沖銷口數）
-  - pd.read_html 在這些多層表頭(rowspan/colspan)的表格上是否能正確斷欄，
-    沒有在真正的 Python 環境跑過，需要你第一次執行時人工核對數字。
+執行需要的套件：requests、pandas、lxml、beautifulsoup4
+  （pip install requests pandas lxml beautifulsoup4）
 
-重要限制（已證實）：
+已知限制（已用 web_fetch 實測證實）：
   - 期交所「三大法人-選擇權買賣權分計」的未平倉欄位是隔一個交易日才公布，
     收盤當天查詢會全部顯示「-」。所以「外(選)」這個欄位沒辦法在收盤當晚
     抓到，建議排程改成「隔天開盤前」執行，或把這欄獨立成晚一天的排程。
 
-若抓取失敗，腳本會印出錯誤並中止該欄位，不會用假資料填補。
+若抓取失敗，腳本會印出錯誤並中止該欄位，不會用假資料填補；其餘欄位仍會
+正常寫入，不會整批失敗。
 """
 
 import csv
@@ -41,6 +43,7 @@ import sys
 
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 
 HEADERS = {
     "User-Agent": (
@@ -80,6 +83,70 @@ def _get(url, params=None):
     resp = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
     resp.raise_for_status()
     return resp
+
+
+def _clean(text):
+    """去除多餘空白、換行，方便比對文字。"""
+    return re.sub(r"\s+", "", text or "")
+
+
+def parse_table_grid(html):
+    """
+    手動解析 HTML 表格並展開 rowspan/colspan，回傳「乾淨的二維陣列」。
+
+    背景：期交所這些「匯出成 Excel 用」的網頁表格大量使用合併儲存格
+    （rowspan/colspan），而且沒有用標準的 <th> 標記表頭。實測發現
+    pandas.read_html 在這種表格上常常抓錯欄位對齊（表頭沒被跳過、
+    合併儲存格沒有正確複製到每一列），是先前「外資大小/前五大十大
+    留倉/選PCR/韭菜指數」抓空值的主因。這裡改用 BeautifulSoup 手動
+    展開合併儲存格，讓每一列、每一欄都對應到畫面上看到的實際位置，
+    表頭列也會被還原成一般文字列（後續用文字比對來跳過，而不是用
+    位置跳過），穩定度比較高。
+    """
+    soup = BeautifulSoup(html, "lxml")
+    tables = soup.find_all("table")
+    if not tables:
+        raise RuntimeError("頁面中找不到任何表格，網站可能已經改版")
+
+    def expand(table):
+        grid = []
+        pending = {}  # col_index -> [剩餘列數, 值]
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["td", "th"])
+            grid_row = []
+            col = 0
+            cell_iter = iter(cells)
+            while True:
+                if col in pending and pending[col][0] > 0:
+                    grid_row.append(pending[col][1])
+                    pending[col][0] -= 1
+                    col += 1
+                    continue
+                try:
+                    cell = next(cell_iter)
+                except StopIteration:
+                    break
+                text = cell.get_text(strip=True)
+                try:
+                    colspan = int(cell.get("colspan", 1) or 1)
+                except ValueError:
+                    colspan = 1
+                try:
+                    rowspan = int(cell.get("rowspan", 1) or 1)
+                except ValueError:
+                    rowspan = 1
+                for _ in range(colspan):
+                    grid_row.append(text)
+                    if rowspan > 1:
+                        pending[col] = [rowspan - 1, text]
+                    col += 1
+            if grid_row:
+                grid.append(grid_row)
+        width = max((len(r) for r in grid), default=0)
+        return [r + [""] * (width - len(r)) for r in grid]
+
+    candidates = [expand(t) for t in tables]
+    return max(candidates, key=len)  # 資料列最多的表格通常就是主表
 
 
 # --------------------------------------------------------------------------
@@ -123,7 +190,10 @@ def fetch_twse_institutional():
             result["自營避險"] = diff_val
         elif name.startswith("投信"):
             result["投信"] = diff_val
-        elif "外資及陸資" in name and "自營商" not in name:
+        elif name.startswith("外資及陸資"):
+            # 注意：不能用「排除含『自營商』字樣」來判斷，因為這個項目
+            # 的完整名稱是「外資及陸資(不含外資自營商)」，字串裡本來就
+            # 含有「自營商」三個字，用排除法會誤判成別的項目而抓到 0。
             result["外資"] = diff_val
     return {
         "外資": result["外資"],
@@ -140,39 +210,31 @@ def fetch_taifex_futures_positions():
     """
     回傳 DataFrame，欄位：商品名稱, 身份別, 未平倉多方口數, 未平倉空方口數, 未平倉多空淨額口數
     對應原檔「期貨」分頁 J/L/N 欄。
+
+    欄位順序（rowspan 展開後，對應畫面上實際看到的位置）：
+    0序號 1商品名稱 2身份別 3口數多方 4契約金額多方 5口數空方 6契約金額空方
+    7口數多空淨額 8契約金額多空淨額 9口數未平倉多方 10契約金額未平倉多方
+    11口數未平倉空方 12契約金額未平倉空方 13口數未平倉淨額 14契約金額未平倉淨額
     """
     url = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
     resp = _get(url)
-    tables = pd.read_html(io.StringIO(resp.text))
-    df = max(tables, key=len)  # 取列數最多的表格，通常就是主表
-    df.columns = [str(c).strip() for c in range(df.shape[1])]
+    grid = parse_table_grid(resp.text)
     records = []
-    current_name = None
-    for _, row in df.iterrows():
-        vals = list(row)
-        # 商品名稱欄若非空就更新目前商品
-        name_cell = str(vals[0]).strip()
-        if name_cell and name_cell not in ("nan", ""):
-            current_name = name_cell
-        role_cell = str(vals[1]).strip() if len(vals) > 1 else ""
-        if role_cell in ("自營商", "投信", "外資"):
-            try:
-                # 實測欄位順序（已用 web_fetch 驗證過一次真實頁面）：
-                # 0序號 1商品名稱 2身份別 3口數多方 4契約金額多方 5口數空方 6契約金額空方
-                # 7口數多空淨額 8契約金額多空淨額 9口數未平倉多方 10契約金額未平倉多方
-                # 11口數未平倉空方 12契約金額未平倉空方 13口數未平倉淨額 14契約金額未平倉淨額
-                long_oi = _to_number(vals[9])    # 未平倉餘額-多方-口數
-                short_oi = _to_number(vals[11])  # 未平倉餘額-空方-口數
-                net_oi = _to_number(vals[13])    # 未平倉餘額-多空淨額-口數
-            except IndexError:
-                continue
-            records.append({
-                "商品名稱": current_name,
-                "身份別": role_cell,
-                "未平倉多方口數": long_oi,
-                "未平倉空方口數": short_oi,
-                "未平倉淨額口數": net_oi,
-            })
+    for row in grid:
+        if len(row) < 15:
+            continue
+        role_cell = row[2].strip()
+        if role_cell not in ("自營商", "投信", "外資"):
+            continue  # 跳過表頭列、合計列等非資料列
+        records.append({
+            "商品名稱": row[1].strip(),
+            "身份別": role_cell,
+            "未平倉多方口數": _to_number(row[9]),
+            "未平倉空方口數": _to_number(row[11]),
+            "未平倉淨額口數": _to_number(row[13]),
+        })
+    if not records:
+        raise RuntimeError("解析不到任何期貨三大法人資料列，頁面格式可能已變更")
     return pd.DataFrame(records)
 
 
@@ -206,25 +268,28 @@ def calc_leek_index(df_futures, mtx_total_oi):
 # --------------------------------------------------------------------------
 
 def fetch_taifex_large_trader():
-    """回傳 (前五大留倉淨額, 前十大留倉淨額)，取『臺股期貨』『所有契約』列，全市場欄位。"""
+    """
+    回傳 (前五大留倉淨額, 前十大留倉淨額)，取『臺股期貨』『所有契約』列，全市場欄位。
+
+    欄位順序：0契約名稱 1到期月份 2前五大買方部位數 3前五大買方百分比
+    4前十大買方部位數 5前十大買方百分比 6前五大賣方部位數 7前五大賣方百分比
+    8前十大賣方部位數 9前十大賣方百分比 10全市場未沖銷部位數
+    """
     url = "https://www.taifex.com.tw/cht/3/largeTraderFutQryTbl"
     resp = _get(url)
-    tables = pd.read_html(io.StringIO(resp.text))
-    df = max(tables, key=len)
-    df.columns = [str(c).strip() for c in range(df.shape[1])]
-
-    target_idx = None
-    for i, row in df.iterrows():
-        name_cell = str(row[0])
-        month_cell = str(row[1])
-        if "臺股期貨" in name_cell:
-            target_idx = i
-        if target_idx is not None and "所有契約" in month_cell:
-            target_row = df.iloc[i]
-            top5_buy = _to_number(target_row[2])   # 前五大-買方-部位數(全市場)
-            top5_sell = _to_number(target_row[6])  # 前五大-賣方-部位數(全市場)
-            top10_buy = _to_number(target_row[4])  # 前十大-買方-部位數(全市場)
-            top10_sell = _to_number(target_row[8])  # 前十大-賣方-部位數(全市場)
+    grid = parse_table_grid(resp.text)
+    for row in grid:
+        if len(row) < 9:
+            continue
+        name_cell = _clean(row[0])
+        month_cell = _clean(row[1])
+        if "臺股期貨" in name_cell and "所有契約" in month_cell:
+            top5_buy = _to_number(row[2])
+            top10_buy = _to_number(row[4])
+            top5_sell = _to_number(row[6])
+            top10_sell = _to_number(row[8])
+            if None in (top5_buy, top10_buy, top5_sell, top10_sell):
+                continue
             return top5_buy - top5_sell, top10_buy - top10_sell
     raise RuntimeError("找不到臺股期貨『所有契約』列，頁面格式可能已變更")
 
@@ -234,14 +299,21 @@ def fetch_taifex_large_trader():
 # --------------------------------------------------------------------------
 
 def fetch_taifex_pcr():
-    """回傳當日『買賣權未平倉量比率%』。"""
+    """
+    回傳當日『買賣權未平倉量比率%』。
+    欄位順序：0日期 1賣權成交量 2買權成交量 3買賣權成交量比率% 4賣權未平倉量
+    5買權未平倉量 6買賣權未平倉量比率%
+    用「日期欄是不是像 2026/8/26 這種格式」來找出第一筆真正的資料列，
+    不依賴固定的列號（表頭有沒有被 pandas 正確跳過並不影響這裡）。
+    """
     url = "https://www.taifex.com.tw/cht/3/pcRatioExcel"
     resp = _get(url)
-    tables = pd.read_html(io.StringIO(resp.text))
-    df = max(tables, key=len)
-    df.columns = [str(c).strip() for c in range(df.shape[1])]
-    first_row = df.iloc[0]
-    return _to_number(first_row[6])  # 買賣權未平倉量比率%
+    grid = parse_table_grid(resp.text)
+    date_pattern = re.compile(r"^\d{4}/\d{1,2}/\d{1,2}$")
+    for row in grid:
+        if len(row) >= 7 and date_pattern.match(row[0].strip()):
+            return _to_number(row[6])
+    raise RuntimeError("找不到選擇權 PCR 資料列，頁面格式可能已變更")
 
 
 # --------------------------------------------------------------------------
@@ -262,35 +334,27 @@ def fetch_taifex_options_institutional():
     """
     url = "https://www.taifex.com.tw/cht/3/callsAndPutsDateExcel"
     resp = _get(url)
-    tables = pd.read_html(io.StringIO(resp.text))
-    df = max(tables, key=len)
-    df.columns = [str(c).strip() for c in range(df.shape[1])]
-
+    grid = parse_table_grid(resp.text)
+    # 欄位順序：0序號 1商品名稱 2權別 3身份別 ... 最後一欄(-1)=未平倉買賣差額契約金額
     call_diff = None
     put_diff = None
-    current_product = None
-    current_type = None
-    for _, row in df.iterrows():
-        vals = list(row)
-        p = str(vals[1]).strip()
-        if p and p not in ("nan", ""):
-            current_product = p
-        t = str(vals[2]).strip()
-        if t in ("買權", "賣權"):
-            current_type = t
-        role = str(vals[3]).strip()
-        if current_product == "臺指選擇權" and role == "外資":
-            raw_val = str(vals[-1]).strip()
+    for row in grid:
+        if len(row) < 5:
+            continue
+        product = row[1].strip()
+        option_type = row[2].strip()
+        role = row[3].strip()
+        if product == "臺指選擇權" and role == "外資":
+            raw_val = row[-1].strip()
             if raw_val in ("-", "", "nan"):
                 raise RuntimeError(
                     "臺指選擇權未平倉資料尚未公布（期交所通常隔一個交易日才揭露），"
                     "請改在隔天開盤前重新執行這個項目。"
                 )
-            # 未平倉餘額-買賣差額-契約金額 欄位（依原表結構為倒數第一欄）
             diff_amount = _to_number(raw_val)
-            if current_type == "買權":
+            if option_type == "買權":
                 call_diff = diff_amount
-            elif current_type == "賣權":
+            elif option_type == "賣權":
                 put_diff = diff_amount
     if call_diff is None or put_diff is None:
         raise RuntimeError("找不到臺指選擇權-外資 未平倉買賣差額，頁面格式可能已變更")
