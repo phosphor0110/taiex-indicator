@@ -455,7 +455,7 @@ def build_today_row():
                 "計算韭菜指數", lambda: calc_leek_index(df_futures, mtx_oi_total)
             )
             if leek_index is not None:
-                row["韭菜指數"] = round(leek_index, 6)
+                row["韭菜指數"] = f"{leek_index * 100:.2f}%"
 
     if errors:
         print("\n以下項目本次沒有抓到，已略過（其餘欄位仍會正常寫入）：")
