@@ -2,8 +2,8 @@ name: 每日更新先行指標
 
 on:
   schedule:
-    # UTC 07:30 = 台灣時間 15:30，週一到週五（台股收盤後）
-    - cron: '30 7 * * 1-5'
+    # UTC 11:00 = 台灣時間 19:00，週一到週五
+    - cron: '0 11 * * 1-5'
   workflow_dispatch: {}   # 允許在 GitHub 網頁上手動按「Run workflow」測試
 
 permissions:
