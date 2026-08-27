@@ -2,8 +2,8 @@ name: 每日更新先行指標
 
 on:
   schedule:
-    # UTC 11:00 = 台灣時間 19:00，週一到週五
-    - cron: '0 11 * * 1-5'
+    # UTC 11:07 = 台灣時間 19:07，週一到週五（刻意錯開整點，避免 GitHub 塞車延遲）
+    - cron: '7 11 * * 1-5'
   workflow_dispatch: {}   # 允許在 GitHub 網頁上手動按「Run workflow」測試
 
 permissions:
