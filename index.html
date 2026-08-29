@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>先行指標</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0B0D10;
+    --surface:#14171C;
+    --surface-2:#1B1F26;
+    --border:#242931;
+    --text:#ECEEF0;
+    --text-muted:#868C97;
+    --text-faint:#565C66;
+    --rise:#E8543D;   /* 台股慣例：紅漲 */
+    --fall:#2FAE66;   /* 台股慣例：綠跌 */
+    --accent:#E0A639;
+    --radius:14px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:'Noto Sans TC',system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+    padding-bottom:48px;
+  }
+  .mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums;}
+
+  header.top{
+    position:sticky; top:0; z-index:10;
+    background:rgba(11,13,16,0.92);
+    backdrop-filter:blur(8px);
+    border-bottom:1px solid var(--border);
+    padding:16px 18px 14px;
+  }
+  header.top .row{display:flex; align-items:baseline; justify-content:space-between; gap:8px;}
+  header.top h1{
+    font-size:20px; font-weight:900; letter-spacing:0.5px; margin:0;
+  }
+  header.top .updated{
+    font-size:12px; color:var(--text-muted);
+    display:flex; align-items:center; gap:6px; white-space:nowrap;
+  }
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--fall);flex:none;}
+  .dot.stale{background:var(--text-faint);}
+  .dot.live{box-shadow:0 0 0 3px rgba(47,174,102,0.18);}
+
+  .stale-banner{
+    margin-top:10px; font-size:12px; color:var(--accent);
+    background:rgba(224,166,57,0.08); border:1px solid rgba(224,166,57,0.25);
+    border-radius:8px; padding:6px 10px;
+  }
+
+  /* sparkline 條 */
+  .ribbon{
+    display:flex; gap:14px; overflow-x:auto; padding:14px 18px 4px;
+    scrollbar-width:none;
+  }
+  .ribbon::-webkit-scrollbar{display:none;}
+  .spark-card{
+    flex:none; width:96px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:10px;
+    padding:8px 10px 6px;
+  }
+  .spark-card .lbl{font-size:10px; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .spark-card canvas{width:100%; height:28px; display:block; margin-top:2px;}
+
+  main{padding:6px 18px 0;}
+
+  section{margin-top:26px;}
+  section > h2{
+    font-size:13px; letter-spacing:1.5px; text-transform:uppercase;
+    color:var(--text-muted); font-weight:700; margin:0 0 10px 2px;
+  }
+
+  .grid{
+    display:grid; grid-template-columns:1fr 1fr; gap:10px;
+  }
+  .card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    padding:12px 14px;
+  }
+  .card .lbl{font-size:12px; color:var(--text-muted); margin-bottom:6px;}
+  .card .val-row{display:flex; align-items:baseline; gap:6px; flex-wrap:wrap;}
+  .card .val{font-size:19px; font-weight:700;}
+  .card .unit{font-size:11px; color:var(--text-faint);}
+  .card .delta{font-size:11px; margin-top:4px; display:flex; align-items:center; gap:3px;}
+  .delta.up{color:var(--rise);}
+  .delta.down{color:var(--fall);}
+  .delta.flat{color:var(--text-faint);}
+  .card .na{color:var(--text-faint); font-size:13px;}
+
+  .chart-block{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    padding:14px 14px 10px;
+    margin-bottom:12px;
+  }
+  .chart-block .head{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;}
+  .chart-block .head .name{font-size:13px; font-weight:700;}
+  .chart-block .head .latest{font-size:13px; color:var(--text-muted);}
+  .chart-block .canvas-wrap{height:150px; position:relative;}
+
+  footer{
+    margin-top:34px; padding:0 18px; color:var(--text-faint); font-size:11px; line-height:1.7;
+  }
+  footer a{color:var(--text-muted);}
+
+  .loading, .error{
+    padding:60px 18px; text-align:center; color:var(--text-muted); font-size:13px;
+  }
+  .error{color:var(--rise);}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="row">
+    <h1>先行指標</h1>
+    <div class="updated" id="updated-line">
+      <span class="dot" id="status-dot"></span>
+      <span id="updated-text">載入中…</span>
+    </div>
+  </div>
+  <div id="stale-banner" style="display:none" class="stale-banner"></div>
+</header>
+
+<div id="ribbon" class="ribbon"></div>
+
+<main>
+  <div id="loading" class="loading">資料讀取中…</div>
+  <div id="error" class="error" style="display:none"></div>
+
+  <section id="snapshot-section" style="display:none">
+    <h2>今日快照</h2>
+    <div class="grid" id="snapshot-grid"></div>
+  </section>
+
+  <section id="charts-section" style="display:none">
+    <h2>歷史走勢</h2>
+    <div id="charts-container"></div>
+  </section>
+</main>
+
+<footer>
+  資料來源：證交所（TWSE）、期交所（TAIFEX）公開資訊，由排程程式每日自動抓取整理。<br>
+  韭菜指數 = 小型臺指期貨（散戶對三大法人）淨部位佔全市場未沖銷口數之比例。<br>
+  <a href="./history.csv" target="_blank">查看原始資料 history.csv</a>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  const INDICATORS = [
+    { key: "成交量", label: "大盤成交量", unit: "億元",
+      parse: v => { const n = parseFloat(String(v).replace(/[,億]/g, "")); return isNaN(n) ? null : n; },
+      fmt: n => n.toLocaleString("zh-TW", { maximumFractionDigits: 1 }) },
+    { key: "外資", label: "外資買賣超", unit: "億元", parse: numOrNull, fmt: fmt1 },
+    { key: "投信", label: "投信買賣超", unit: "億元", parse: numOrNull, fmt: fmt1 },
+    { key: "自營", label: "自營商買賣超", unit: "億元", parse: numOrNull, fmt: fmt1 },
+    { key: "外資大小", label: "外資大小台淨部位", unit: "口", parse: numOrNull, fmt: fmt0 },
+    { key: "前五大交易人留倉", label: "前五大交易人留倉", unit: "口", parse: numOrNull, fmt: fmt0 },
+    { key: "前十大交易人留倉", label: "前十大交易人留倉", unit: "口", parse: numOrNull, fmt: fmt0 },
+    { key: "選PCR", label: "選擇權 Put/Call Ratio", unit: "%", parse: numOrNull, fmt: fmt2 },
+    { key: "外(選)", label: "外資選擇權淨部位金額", unit: "元", parse: numOrNull, fmt: fmt0 },
+    { key: "韭菜指數", label: "韭菜指數", unit: "%", parse: parsePercentField, fmt: fmt2 },
+    { key: "未平倉口數", label: "大台未沖銷口數", unit: "口", parse: numOrNull, fmt: fmt0 },
+  ];
+
+  function numOrNull(v) {
+    if (v === undefined || v === null || String(v).trim() === "") return null;
+    const n = parseFloat(String(v).replace(/,/g, ""));
+    return isNaN(n) ? null : n;
+  }
+
+  // 相容舊格式：改百分比顯示之前，韭菜指數是存小數（如 0.0252），
+  // 之後改成存字串「2.52%」。這裡統一還原成百分比數字方便畫圖。
+  function parsePercentField(v) {
+    if (v === undefined || v === null || String(v).trim() === "") return null;
+    const s = String(v).trim();
+    if (s.endsWith("%")) {
+      const n = parseFloat(s);
+      return isNaN(n) ? null : n;
+    }
+    const n = parseFloat(s);
+    if (isNaN(n)) return null;
+    return n * 100;
+  }
+
+  function fmt0(n) { return Math.round(n).toLocaleString("zh-TW"); }
+  function fmt1(n) { return n.toLocaleString("zh-TW", { maximumFractionDigits: 1, minimumFractionDigits: 1 }); }
+  function fmt2(n) { return n.toLocaleString("zh-TW", { maximumFractionDigits: 2, minimumFractionDigits: 2 }); }
+
+  const COLORS = { rise: "#E8543D", fall: "#2FAE66", flat: "#565C66", accent: "#E0A639", grid: "#242931", text: "#868C97" };
+
+  function el(tag, cls, html) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html !== undefined) e.innerHTML = html;
+    return e;
+  }
+
+  function loadCSV() {
+    const url = "./history.csv?t=" + Date.now(); // 避開瀏覽器快取
+    return fetch(url)
+      .then(res => {
+        if (!res.ok) throw new Error("history.csv 讀取失敗（HTTP " + res.status + "）");
+        return res.text();
+      })
+      .then(text => {
+        const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+        if (parsed.errors && parsed.errors.length) {
+          console.warn("CSV parse warnings:", parsed.errors);
+        }
+        return parsed.data;
+      });
+  }
+
+  function normalizeRows(rawRows) {
+    return rawRows
+      .filter(r => r["日期"])
+      .map(r => {
+        const row = { 日期: r["日期"] };
+        INDICATORS.forEach(ind => { row[ind.key] = ind.parse(r[ind.key]); });
+        return row;
+      })
+      .sort((a, b) => a.日期.localeCompare(b.日期));
+  }
+
+  function findLatestTwo(rows, key) {
+    const withVal = rows.filter(r => r[key] !== null && r[key] !== undefined);
+    return [withVal[withVal.length - 1] || null, withVal[withVal.length - 2] || null];
+  }
+
+  function daysBetween(dateStr) {
+    const d = new Date(dateStr + "T00:00:00+08:00");
+    const now = new Date();
+    return Math.floor((now - d) / 86400000);
+  }
+
+  function renderHeader(rows) {
+    const latestDateRow = rows[rows.length - 1];
+    const dot = document.getElementById("status-dot");
+    const text = document.getElementById("updated-text");
+    const banner = document.getElementById("stale-banner");
+    if (!latestDateRow) {
+      text.textContent = "尚無資料";
+      dot.classList.add("stale");
+      return;
+    }
+    text.textContent = "更新於 " + latestDateRow.日期;
+    const gap = daysBetween(latestDateRow.日期);
+    if (gap >= 4) {
+      dot.classList.add("stale");
+      banner.style.display = "block";
+      banner.textContent = "資料已經 " + gap + " 天沒更新，排程可能沒有正常執行，建議去 GitHub Actions 檢查一下。";
+    } else {
+      dot.classList.add("live");
+    }
+  }
+
+  function renderRibbon(rows) {
+    const wrap = document.getElementById("ribbon");
+    wrap.innerHTML = "";
+    const recent = rows.slice(-30);
+    INDICATORS.forEach(ind => {
+      const card = el("div", "spark-card");
+      card.appendChild(el("div", "lbl", ind.label));
+      const canvas = document.createElement("canvas");
+      card.appendChild(canvas);
+      wrap.appendChild(card);
+
+      const points = recent.map(r => r[ind.key]);
+      const [last, prev] = findLatestTwo(rows, ind.key);
+      const trendUp = last && prev ? last[ind.key] >= prev[ind.key] : true;
+      const lineColor = trendUp ? COLORS.rise : COLORS.fall;
+
+      new Chart(canvas.getContext("2d"), {
+        type: "line",
+        data: {
+          labels: recent.map(r => r.日期),
+          datasets: [{
+            data: points, borderColor: lineColor, borderWidth: 1.5,
+            pointRadius: 0, spanGaps: true, tension: 0.25,
+          }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: false,
+          scales: { x: { display: false }, y: { display: false } },
+          plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        },
+      });
+    });
+  }
+
+  function renderSnapshot(rows) {
+    const grid = document.getElementById("snapshot-grid");
+    grid.innerHTML = "";
+    INDICATORS.forEach(ind => {
+      const [last, prev] = findLatestTwo(rows, ind.key);
+      const card = el("div", "card");
+      card.appendChild(el("div", "lbl", ind.label));
+
+      if (!last) {
+        card.appendChild(el("div", "na", "今日尚未取得"));
+        grid.appendChild(card);
+        return;
+      }
+      const valRow = el("div", "val-row");
+      valRow.appendChild(el("span", "val mono", ind.fmt(last[ind.key])));
+      valRow.appendChild(el("span", "unit", ind.unit));
+      card.appendChild(valRow);
+
+      if (prev) {
+        const diff = last[ind.key] - prev[ind.key];
+        const dir = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
+        const arrow = dir === "up" ? "▲" : dir === "down" ? "▼" : "—";
+        const deltaEl = el("div", "delta " + dir + " mono",
+          arrow + " " + ind.fmt(Math.abs(diff)) + " <span class=\"unit\">vs 前一日</span>");
+        card.appendChild(deltaEl);
+      } else {
+        card.appendChild(el("div", "delta flat", "無前一日資料可比較"));
+      }
+      grid.appendChild(card);
+    });
+  }
+
+  function renderCharts(rows) {
+    const container = document.getElementById("charts-container");
+    container.innerHTML = "";
+    const recent = rows.slice(-60); // 近 60 個交易日
+
+    INDICATORS.forEach(ind => {
+      const block = el("div", "chart-block");
+      const head = el("div", "head");
+      head.appendChild(el("span", "name", ind.label));
+      const [last] = findLatestTwo(rows, ind.key);
+      head.appendChild(el("span", "latest mono", last ? (ind.fmt(last[ind.key]) + " " + ind.unit) : "—"));
+      block.appendChild(head);
+
+      const wrap = el("div", "canvas-wrap");
+      const canvas = document.createElement("canvas");
+      wrap.appendChild(canvas);
+      block.appendChild(wrap);
+      container.appendChild(block);
+
+      new Chart(canvas.getContext("2d"), {
+        type: "line",
+        data: {
+          labels: recent.map(r => r.日期.slice(5)), // MM-DD
+          datasets: [{
+            data: recent.map(r => r[ind.key]),
+            borderColor: COLORS.accent,
+            backgroundColor: "rgba(224,166,57,0.08)",
+            borderWidth: 1.75, pointRadius: 0, spanGaps: true,
+            tension: 0.25, fill: true,
+          }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false,
+          interaction: { mode: "index", intersect: false },
+          scales: {
+            x: { ticks: { color: COLORS.text, maxTicksLimit: 6, font: { family: "JetBrains Mono", size: 10 } },
+                 grid: { color: COLORS.grid } },
+            y: { ticks: { color: COLORS.text, maxTicksLimit: 5, font: { family: "JetBrains Mono", size: 10 } },
+                 grid: { color: COLORS.grid } },
+          },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: "#1B1F26", borderColor: "#242931", borderWidth: 1,
+              titleFont: { family: "JetBrains Mono" }, bodyFont: { family: "JetBrains Mono" },
+            },
+          },
+        },
+      });
+    });
+  }
+
+  loadCSV()
+    .then(rawRows => {
+      const rows = normalizeRows(rawRows);
+      document.getElementById("loading").style.display = "none";
+      if (!rows.length) {
+        const errBox = document.getElementById("error");
+        errBox.style.display = "block";
+        errBox.textContent = "history.csv 目前沒有任何資料列。";
+        return;
+      }
+      renderHeader(rows);
+      renderRibbon(rows);
+      renderSnapshot(rows);
+      renderCharts(rows);
+      document.getElementById("snapshot-section").style.display = "block";
+      document.getElementById("charts-section").style.display = "block";
+    })
+    .catch(err => {
+      document.getElementById("loading").style.display = "none";
+      const errBox = document.getElementById("error");
+      errBox.style.display = "block";
+      errBox.textContent = "讀取失敗：" + err.message;
+      console.error(err);
+    });
+})();
+</script>
+
+</body>
+</html>
