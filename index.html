@@ -72,7 +72,8 @@
     padding:8px 10px 6px;
   }
   .spark-card .lbl{font-size:10px; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
-  .spark-card canvas{width:100%; height:28px; display:block; margin-top:2px;}
+  .spark-canvas-wrap{height:28px; margin-top:2px;}
+  .spark-canvas-wrap svg{width:100%; height:100%; display:block;}
 
   main{padding:6px 18px 0;}
 
@@ -204,6 +205,27 @@
   function fmt1(n) { return n.toLocaleString("zh-TW", { maximumFractionDigits: 1, minimumFractionDigits: 1 }); }
   function fmt2(n) { return n.toLocaleString("zh-TW", { maximumFractionDigits: 2, minimumFractionDigits: 2 }); }
 
+  // 純 SVG 手繪迷你趨勢線（不用 Chart.js）：用 viewBox 縮放，不依賴容器
+  // 高度的即時量測，不會有 canvas 響應式縮放在 flex 版面下無限延伸的問題。
+  function buildSparklineSVG(values, color) {
+    const W = 100, H = 28, PAD = 2;
+    const pts = values
+      .map((v, i) => ({ v, i }))
+      .filter(p => typeof p.v === "number" && !isNaN(p.v));
+    if (pts.length < 2) {
+      return '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none"></svg>';
+    }
+    const xs = pts.map(p => p.i), ys = pts.map(p => p.v);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const sx = x => (maxX === minX ? W / 2 : PAD + ((x - minX) / (maxX - minX)) * (W - 2 * PAD));
+    const sy = y => (maxY === minY ? H / 2 : H - PAD - ((y - minY) / (maxY - minY)) * (H - 2 * PAD));
+    const points = pts.map(p => sx(p.i).toFixed(1) + "," + sy(p.v).toFixed(1)).join(" ");
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
+      '<polyline points="' + points + '" fill="none" stroke="' + color +
+      '" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+  }
+
   const COLORS = { rise: "#E8543D", fall: "#2FAE66", flat: "#565C66", accent: "#E0A639", grid: "#242931", text: "#868C97" };
 
   function el(tag, cls, html) {
@@ -279,8 +301,8 @@
     INDICATORS.forEach(ind => {
       const card = el("div", "spark-card");
       card.appendChild(el("div", "lbl", ind.label));
-      const canvas = document.createElement("canvas");
-      card.appendChild(canvas);
+      const canvasWrap = el("div", "spark-canvas-wrap");
+      card.appendChild(canvasWrap);
       wrap.appendChild(card);
 
       const points = recent.map(r => r[ind.key]);
@@ -288,22 +310,7 @@
       const trendUp = last && prev ? last[ind.key] >= prev[ind.key] : true;
       const lineColor = trendUp ? COLORS.rise : COLORS.fall;
 
-      new Chart(canvas.getContext("2d"), {
-        type: "line",
-        data: {
-          labels: recent.map(r => r.日期),
-          datasets: [{
-            data: points, borderColor: lineColor, borderWidth: 1.5,
-            pointRadius: 0, spanGaps: true, tension: 0.25,
-          }],
-        },
-        options: {
-          responsive: true, maintainAspectRatio: false,
-          animation: false,
-          scales: { x: { display: false }, y: { display: false } },
-          plugins: { legend: { display: false }, tooltip: { enabled: false } },
-        },
-      });
+      canvasWrap.innerHTML = buildSparklineSVG(points, lineColor);
     });
   }
 
