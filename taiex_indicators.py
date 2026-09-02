@@ -149,6 +149,61 @@ def parse_table_grid(html):
     return max(candidates, key=len)  # 資料列最多的表格通常就是主表
 
 
+def parse_all_table_grids(html):
+    """
+    跟 parse_table_grid 用同一套 rowspan/colspan 展開邏輯，但回傳頁面上
+    「每一張」表格（而不是只挑列數最多的那張）。
+
+    背景：期交所「期貨每日行情」這類頁面常常同時放好幾張表格（一般交易
+    時段、盤後交易時段、價差行情表……），用「列數最多」去猜哪張是主表
+    並不可靠——這是造成「未沖銷契約量」欄位有時候抓不到的原因。改成
+    把每張表都展開，之後用表頭文字去比對、找出真正需要的那張。
+    """
+    soup = BeautifulSoup(html, "lxml")
+    tables = soup.find_all("table")
+    if not tables:
+        raise RuntimeError("頁面中找不到任何表格，網站可能已經改版")
+
+    def expand(table):
+        grid = []
+        pending = {}
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["td", "th"])
+            grid_row = []
+            col = 0
+            cell_iter = iter(cells)
+            while True:
+                if col in pending and pending[col][0] > 0:
+                    grid_row.append(pending[col][1])
+                    pending[col][0] -= 1
+                    col += 1
+                    continue
+                try:
+                    cell = next(cell_iter)
+                except StopIteration:
+                    break
+                text = cell.get_text(strip=True)
+                try:
+                    colspan = int(cell.get("colspan", 1) or 1)
+                except ValueError:
+                    colspan = 1
+                try:
+                    rowspan = int(cell.get("rowspan", 1) or 1)
+                except ValueError:
+                    rowspan = 1
+                for _ in range(colspan):
+                    grid_row.append(text)
+                    if rowspan > 1:
+                        pending[col] = [rowspan - 1, text]
+                    col += 1
+            if grid_row:
+                grid.append(grid_row)
+        width = max((len(r) for r in grid), default=0)
+        return [r + [""] * (width - len(r)) for r in grid]
+
+    return [expand(t) for t in tables]
+
+
 # --------------------------------------------------------------------------
 # 1. TWSE 大盤成交量
 # --------------------------------------------------------------------------
@@ -367,29 +422,43 @@ def fetch_taifex_options_institutional():
 
 def fetch_taifex_daily_market(commodity_id=None):
     """
-    回傳 DataFrame：契約, 到期月份, 未沖銷契約量
-    commodity_id=None 時抓「大台指(TX)」為主的全部契約頁；
-    commodity_id='MTX' 時抓小型臺指期貨頁。
+    回傳 DataFrame，只含『到期月份』『未沖銷契約量』兩欄。
+
+    這個頁面同時放了好幾張表格（一般交易時段／盤後交易時段／價差行情表），
+    不能用「列數最多」去猜哪張是主表——這裡改成掃過每一張表格，用表頭
+    文字（同時出現「到期月份」和「未沖銷契約量」）找出真正要的那張，
+    欄位位置用表頭比對，不寫死固定欄號。
     """
     url = "https://www.taifex.com.tw/cht/3/futDailyMarketExcel"
     params = {"commodity_id": commodity_id} if commodity_id else {}
     resp = _get(url, params=params)
-    tables = pd.read_html(io.StringIO(resp.text))
-    df = max(tables, key=len)
-    df.columns = [str(c).strip() for c in range(df.shape[1])]
-    df = df.rename(columns={"0": "契約", "1": "到期月份", "12": "未沖銷契約量"})
-    return df
+    grids = parse_all_table_grids(resp.text)
+
+    for grid in grids:
+        for row_idx, row in enumerate(grid[:5]):  # 表頭通常在前幾列
+            cleaned = [_clean(c) for c in row]
+            has_month = any("到期月份" in c for c in cleaned)
+            has_oi = any("未沖銷契約量" in c for c in cleaned)
+            if not (has_month and has_oi):
+                continue
+            col_month = next(i for i, c in enumerate(cleaned) if "到期月份" in c)
+            col_oi = next(i for i, c in enumerate(cleaned) if "未沖銷契約量" in c)
+            records = []
+            for data_row in grid[row_idx + 1:]:
+                if len(data_row) <= max(col_month, col_oi):
+                    continue
+                month = data_row[col_month].strip()
+                oi = _to_number(data_row[col_oi])
+                if month and oi is not None:
+                    records.append({"到期月份": month, "未沖銷契約量": oi})
+            if records:
+                return pd.DataFrame(records)
+    raise RuntimeError("找不到期貨每日行情的未沖銷契約量欄位，頁面格式可能已變更")
 
 
-def calc_open_interest_total(df_market, contract_code):
-    """加總指定契約代碼（如 TX）在所有到期月份的未沖銷契約量。"""
-    sub = df_market[df_market["契約"] == contract_code]
-    total = 0.0
-    for v in sub["未沖銷契約量"]:
-        n = _to_number(v)
-        if n is not None:
-            total += n
-    return total
+def calc_open_interest_total(df_market):
+    """加總表格裡所有到期月份的未沖銷契約量。"""
+    return float(df_market["未沖銷契約量"].sum())
 
 
 # --------------------------------------------------------------------------
@@ -442,7 +511,7 @@ def build_today_row():
     df_tx_market = safe("TAIFEX 大台指每日行情", fetch_taifex_daily_market)
     if df_tx_market is not None:
         row["未平倉口數"] = safe(
-            "計算大台未沖銷口數合計", lambda: calc_open_interest_total(df_tx_market, "TX")
+            "計算大台未沖銷口數合計", lambda: calc_open_interest_total(df_tx_market)
         )
 
     if df_futures is not None:
@@ -450,12 +519,15 @@ def build_today_row():
             "TAIFEX 小台指每日行情", lambda: fetch_taifex_daily_market("MTX")
         )
         if df_mtx_market is not None:
-            mtx_oi_total = calc_open_interest_total(df_mtx_market, "MTX")
-            leek_index = safe(
-                "計算韭菜指數", lambda: calc_leek_index(df_futures, mtx_oi_total)
+            mtx_oi_total = safe(
+                "計算小台未沖銷口數合計", lambda: calc_open_interest_total(df_mtx_market)
             )
-            if leek_index is not None:
-                row["韭菜指數"] = f"{leek_index * 100:.2f}%"
+            if mtx_oi_total is not None:
+                leek_index = safe(
+                    "計算韭菜指數", lambda: calc_leek_index(df_futures, mtx_oi_total)
+                )
+                if leek_index is not None:
+                    row["韭菜指數"] = f"{leek_index * 100:.2f}%"
 
     if errors:
         print("\n以下項目本次沒有抓到，已略過（其餘欄位仍會正常寫入）：")
@@ -482,7 +554,15 @@ def append_to_history(row, path=HISTORY_CSV):
 
 
 def main():
-    row = build_today_row()
+    try:
+        row = build_today_row()
+    except Exception:
+        # 保底防線：就算 build_today_row() 本身邏輯出現非預期例外，
+        # 也印出完整錯誤內容方便排查，同時讓這次執行清楚地算失敗，
+        # 而不是留下一個內容不完整、卻被誤判成功的 history.csv。
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     print(row)
     append_to_history(row)
 
