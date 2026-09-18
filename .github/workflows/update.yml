@@ -12,6 +12,13 @@ on:
 permissions:
   contents: write   # 讓這個排程可以把新資料 commit 回倉庫
 
+# 避免「手動測試」跟「排程自動觸發」剛好同時執行，兩邊搶著 push 導致失敗。
+# 加上這個設定後，如果已經有一次在跑，新的一次會排隊等前一次跑完才開始，
+# 不會同時執行。
+concurrency:
+  group: update-history-csv
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -35,5 +42,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add history.csv
-          git diff --cached --quiet || git commit -m "自動更新 $(date +'%Y-%m-%d')"
-          git push
+          if git diff --cached --quiet; then
+            echo "沒有新資料需要提交"
+            exit 0
+          fi
+          git commit -m "自動更新 $(date +'%Y-%m-%d')"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push; then
+              exit 0
+            fi
+            echo "推送失敗，準備第 $((i + 1)) 次嘗試..."
+            sleep $((RANDOM % 10 + 5))
+          done
+          echo "多次重試後仍然推送失敗"
+          exit 1
