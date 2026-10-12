@@ -465,6 +465,54 @@ def calc_open_interest_total(df_market):
 # 主流程
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# 休市日判斷（國定假日 / 補假 / 颱風之外的例行休市）
+# --------------------------------------------------------------------------
+
+def _normalize_date(raw):
+    """把 '2026-09-28'、'2026/09/28'、'115/09/28'、'115年09月28日' 統一成 'YYYY-MM-DD'。"""
+    m = re.search(r"(\d{2,4})\D+(\d{1,2})\D+(\d{1,2})", str(raw))
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if y < 1911:  # 民國年
+        y += 1911
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
+def is_market_closed(day):
+    """
+    回傳 (是否休市, 原因)。
+    1. 週六、週日 -> 休市
+    2. 證交所「市場開休市日期」官方 API 列出的日期 -> 休市
+       （名稱含「開始交易」「最後交易」的是有開盤的資訊列，不算休市）
+    查詢官方日曆失敗時「不擋」（回傳 False），寧可多抓一次，也不要漏掉資料；
+    此時原本的逐欄位容錯仍會運作。
+    """
+    if day.weekday() >= 5:
+        return True, "週末"
+    url = "https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule"
+    try:
+        resp = _get(url, params={"response": "json", "date": f"{day.year}0101"})
+        data = resp.json()
+    except Exception as e:
+        print(f"[休市判斷] 查詢證交所休市日曆失敗（{e}），視為有開盤，照常執行。")
+        return False, None
+    if str(data.get("stat", "")).lower() != "ok":
+        print(f"[休市判斷] 休市日曆回傳異常（stat={data.get('stat')}），視為有開盤，照常執行。")
+        return False, None
+    iso = day.isoformat()
+    for r in data.get("data", []):
+        if not r or _normalize_date(r[0]) != iso:
+            continue
+        name = str(r[1]).strip() if len(r) > 1 else ""
+        desc = str(r[2]).strip() if len(r) > 2 else ""
+        if "開始交易" in name + desc or "最後交易" in name + desc:
+            return False, None
+        return True, (name + " " + desc).strip()
+    return False, None
+
+
 def build_today_row():
     """
     逐項抓取，單一項目失敗不影響其他項目：失敗的欄位填 None，並在 errors
@@ -554,6 +602,14 @@ def append_to_history(row, path=HISTORY_CSV):
 
 
 def main():
+    today = dt.date.today()
+    force = os.environ.get("FORCE_RUN", "").strip().lower() in ("1", "true", "yes")
+    closed, reason = is_market_closed(today)
+    if closed and not force:
+        print(f"{today} 台股休市（{reason}），略過本次更新，不寫入任何資料。")
+        return
+    if closed and force:
+        print(f"{today} 台股休市（{reason}），但已指定強制執行，繼續。")
     try:
         row = build_today_row()
     except Exception:
