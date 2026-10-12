@@ -2,19 +2,18 @@ name: 每日更新先行指標
 
 on:
   schedule:
-    # UTC 06:07 = 台灣時間 14:07，週一到週五
-    # 注意：這個時間點在收盤(13:30/13:45)後不久，證交所/期交所大部分
-    # 資料通常要到 15:30~16:00 左右才會公布完整，設在這個時間很可能
-    # 會有多個欄位抓到空值（程式會照常跳過，不會整支失敗，但資料不完整）。
+    # UTC 06:07 = 台灣時間 14:07，週一到週五（休市日由程式自行判斷並略過）
     - cron: '7 6 * * 1-5'
-  workflow_dispatch: {}   # 允許在 GitHub 網頁上手動按「Run workflow」測試
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '休市日也強制執行（測試用）'
+        type: boolean
+        default: false
 
 permissions:
-  contents: write   # 讓這個排程可以把新資料 commit 回倉庫
+  contents: write
 
-# 避免「手動測試」跟「排程自動觸發」剛好同時執行，兩邊搶著 push 導致失敗。
-# 加上這個設定後，如果已經有一次在跑，新的一次會排隊等前一次跑完才開始，
-# 不會同時執行。
 concurrency:
   group: update-history-csv
   cancel-in-progress: false
@@ -34,7 +33,9 @@ jobs:
       - name: 安裝需要的套件
         run: pip install requests pandas lxml beautifulsoup4
 
-      - name: 執行抓取與計算
+      - name: 執行抓取與計算（休市日會自動略過）
+        env:
+          FORCE_RUN: ${{ inputs.force }}
         run: python taiex_indicators.py
 
       - name: 把新資料寫回倉庫
