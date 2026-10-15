@@ -243,6 +243,9 @@
         return res.text();
       })
       .then(text => {
+        // 統一換行符號：CSV 若混用 CRLF 與 LF（例如在 GitHub 網頁上手動編輯過），
+        // PapaParse 只會用第一個換行符號切列，混到的那幾列會黏成一列而消失。
+        text = text.replace(/\r\n?/g, "\n");
         const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
         if (parsed.errors && parsed.errors.length) {
           console.warn("CSV parse warnings:", parsed.errors);

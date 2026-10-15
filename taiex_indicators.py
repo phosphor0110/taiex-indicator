@@ -8,7 +8,7 @@
 
 執行後會：
   1. 向證交所(TWSE)、期交所(TAIFEX)抓取當日公開資料
-  2. 依照原始 Excel 檔的公式，計算出「先行指標」8 個欄位
+  2. 依照原始 Excel 檔的公式，計算出「先行指標」11 個欄位
   3. 把新的一列資料附加寫入 history.csv（若當天已存在則跳過，避免重複）
 
 版本紀錄（依實際執行結果修正過）：
@@ -21,6 +21,14 @@
        pandas.read_html 在期交所這種多層合併儲存格(rowspan/colspan)
        的表格上常常抓錯欄位對齊——已改用 BeautifulSoup 手動展開合併
        儲存格（parse_table_grid），不再依賴 pandas 的自動判斷。
+  v2 發現休市日（2026-09-25、09-28）寫進了假資料：證交所欄位變成 0，
+     期交所欄位是前一個交易日的數字。原因是期交所網址沒帶日期、預設回傳
+     「最新已公布的一天」，證交所查無資料時程式又預設填 0。已修正為：
+       - 期交所每個頁面都先核對頁面上的資料日期，不是今天就不採用
+       - 證交所檢查 stat / date 欄位，查無資料或日期不符就不採用
+       - 三大法人找不到對應項目時改為失敗（留空），不再預設填 0
+       - 「今天」一律用台灣時間計算，手動執行時也不會跨日算錯
+       - 同一天重跑時，只補上之前沒抓到的空白欄位（不用再手動刪列）
 
 執行需要的套件：requests、pandas、lxml、beautifulsoup4
   （pip install requests pandas lxml beautifulsoup4）
@@ -40,6 +48,7 @@ import io
 import os
 import re
 import sys
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -90,6 +99,37 @@ def _clean(text):
     return re.sub(r"\s+", "", text or "")
 
 
+def _today():
+    """台灣時間的今天。GitHub Actions 主機是 UTC，手動在台灣早上 8 點前執行會差一天。"""
+    return dt.datetime.now(ZoneInfo("Asia/Taipei")).date()
+
+
+def _check_taifex_date(html, page_name):
+    """
+    確認期交所頁面上的資料日期就是今天，不是的話就報錯（該欄位留空）。
+
+    期交所這些網址沒帶日期參數時，會回傳「最新已公布的那一天」：休市日或
+    當天資料還沒公布時，拿到的其實是前一個交易日的數字。實測每個頁面裡
+    第一個出現的 YYYY/M/D 日期就是資料日期（PCR 頁則是最新一筆資料列）。
+    """
+    m = re.search(r"(20\d{2})/(\d{1,2})/(\d{1,2})", html)
+    if not m:
+        raise RuntimeError(f"{page_name} 頁面找不到資料日期，網站可能已經改版")
+    page_date = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if page_date != _today():
+        raise RuntimeError(
+            f"{page_name} 目前的資料日期是 {page_date}，不是今天（今天的資料可能還沒公布），不採用"
+        )
+
+
+def _check_twse_json(data, page_name):
+    """證交所查無資料時 stat 不是 OK；有資料時 date 欄位是 YYYYMMDD，要等於今天。"""
+    if str(data.get("stat", "")).upper() != "OK":
+        raise RuntimeError(f"{page_name} 查無今天資料（{data.get('stat')}）")
+    if data.get("date") and data["date"] != _today().strftime("%Y%m%d"):
+        raise RuntimeError(f"{page_name} 回傳的資料日期是 {data['date']}，不是今天，不採用")
+
+
 def parse_table_grid(html):
     """
     手動解析 HTML 表格並展開 rowspan/colspan，回傳「乾淨的二維陣列」。
@@ -103,56 +143,13 @@ def parse_table_grid(html):
     表頭列也會被還原成一般文字列（後續用文字比對來跳過，而不是用
     位置跳過），穩定度比較高。
     """
-    soup = BeautifulSoup(html, "lxml")
-    tables = soup.find_all("table")
-    if not tables:
-        raise RuntimeError("頁面中找不到任何表格，網站可能已經改版")
-
-    def expand(table):
-        grid = []
-        pending = {}  # col_index -> [剩餘列數, 值]
-        for tr in table.find_all("tr"):
-            cells = tr.find_all(["td", "th"])
-            grid_row = []
-            col = 0
-            cell_iter = iter(cells)
-            while True:
-                if col in pending and pending[col][0] > 0:
-                    grid_row.append(pending[col][1])
-                    pending[col][0] -= 1
-                    col += 1
-                    continue
-                try:
-                    cell = next(cell_iter)
-                except StopIteration:
-                    break
-                text = cell.get_text(strip=True)
-                try:
-                    colspan = int(cell.get("colspan", 1) or 1)
-                except ValueError:
-                    colspan = 1
-                try:
-                    rowspan = int(cell.get("rowspan", 1) or 1)
-                except ValueError:
-                    rowspan = 1
-                for _ in range(colspan):
-                    grid_row.append(text)
-                    if rowspan > 1:
-                        pending[col] = [rowspan - 1, text]
-                    col += 1
-            if grid_row:
-                grid.append(grid_row)
-        width = max((len(r) for r in grid), default=0)
-        return [r + [""] * (width - len(r)) for r in grid]
-
-    candidates = [expand(t) for t in tables]
-    return max(candidates, key=len)  # 資料列最多的表格通常就是主表
+    return max(parse_all_table_grids(html), key=len)  # 資料列最多的表格通常就是主表
 
 
 def parse_all_table_grids(html):
     """
-    跟 parse_table_grid 用同一套 rowspan/colspan 展開邏輯，但回傳頁面上
-    「每一張」表格（而不是只挑列數最多的那張）。
+    展開 rowspan/colspan 的實際邏輯，回傳頁面上「每一張」表格（而不是只挑
+    列數最多的那張）。
 
     背景：期交所「期貨每日行情」這類頁面常常同時放好幾張表格（一般交易
     時段、盤後交易時段、價差行情表……），用「列數最多」去猜哪張是主表
@@ -166,7 +163,7 @@ def parse_all_table_grids(html):
 
     def expand(table):
         grid = []
-        pending = {}
+        pending = {}  # col_index -> [剩餘列數, 值]
         for tr in table.find_all("tr"):
             cells = tr.find_all(["td", "th"])
             grid_row = []
@@ -212,9 +209,10 @@ def fetch_twse_volume():
     """證交所每日成交量統計，取『總計(1~15)』成交金額(元)。"""
     url = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
     # TWSE 的 rwd JSON API 比原本的 HTML 頁面更穩定，直接查當日
-    today = dt.date.today().strftime("%Y%m%d")
+    today = _today().strftime("%Y%m%d")
     resp = _get(url, params={"date": today, "type": "ALL", "response": "json"})
     data = resp.json()
+    _check_twse_json(data, "TWSE 成交量")
     for table in data.get("tables", []):
         if "總計" in "".join(table.get("title", "")) or table.get("fields") and "成交金額" in "".join(table["fields"]):
             for row in table.get("data", []):
@@ -231,11 +229,13 @@ def fetch_twse_volume():
 def fetch_twse_institutional():
     """回傳 dict：外資、投信、自營（自行+避險合計），單位：元。"""
     url = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
-    today = dt.date.today().strftime("%Y%m%d")
+    today = _today().strftime("%Y%m%d")
     resp = _get(url, params={"dayDate": today, "type": "day", "response": "json"})
     data = resp.json()
+    _check_twse_json(data, "TWSE 三大法人")
     rows = data.get("data", [])
-    result = {"自營自行": 0.0, "自營避險": 0.0, "投信": 0.0, "外資": 0.0}
+    # 預設 None 而不是 0：找不到項目時要能看出「沒抓到」，不能跟「買賣超剛好 0」混在一起
+    result = {"自營自行": None, "自營避險": None, "投信": None, "外資": None}
     for row in rows:
         name, buy, sell, diff = row[0], row[1], row[2], row[3]
         diff_val = _to_number(diff)
@@ -250,6 +250,9 @@ def fetch_twse_institutional():
             # 的完整名稱是「外資及陸資(不含外資自營商)」，字串裡本來就
             # 含有「自營商」三個字，用排除法會誤判成別的項目而抓到 0。
             result["外資"] = diff_val
+    missing = [k for k, v in result.items() if v is None]
+    if missing:
+        raise RuntimeError(f"三大法人資料缺少 {'、'.join(missing)}，頁面格式可能已變更")
     return {
         "外資": result["外資"],
         "投信": result["投信"],
@@ -273,6 +276,7 @@ def fetch_taifex_futures_positions():
     """
     url = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
     resp = _get(url)
+    _check_taifex_date(resp.text, "期交所三大法人期貨")
     grid = parse_table_grid(resp.text)
     records = []
     for row in grid:
@@ -332,6 +336,7 @@ def fetch_taifex_large_trader():
     """
     url = "https://www.taifex.com.tw/cht/3/largeTraderFutQryTbl"
     resp = _get(url)
+    _check_taifex_date(resp.text, "期交所大額交易人")
     grid = parse_table_grid(resp.text)
     for row in grid:
         if len(row) < 9:
@@ -363,6 +368,7 @@ def fetch_taifex_pcr():
     """
     url = "https://www.taifex.com.tw/cht/3/pcRatioExcel"
     resp = _get(url)
+    _check_taifex_date(resp.text, "期交所選擇權 PCR")
     grid = parse_table_grid(resp.text)
     date_pattern = re.compile(r"^\d{4}/\d{1,2}/\d{1,2}$")
     for row in grid:
@@ -389,6 +395,7 @@ def fetch_taifex_options_institutional():
     """
     url = "https://www.taifex.com.tw/cht/3/callsAndPutsDateExcel"
     resp = _get(url)
+    _check_taifex_date(resp.text, "期交所法人選擇權")
     grid = parse_table_grid(resp.text)
     # 欄位順序：0序號 1商品名稱 2權別 3身份別 ... 最後一欄(-1)=未平倉買賣差額契約金額
     call_diff = None
@@ -432,6 +439,7 @@ def fetch_taifex_daily_market(commodity_id=None):
     url = "https://www.taifex.com.tw/cht/3/futDailyMarketExcel"
     params = {"commodity_id": commodity_id} if commodity_id else {}
     resp = _get(url, params=params)
+    _check_taifex_date(resp.text, f"期交所每日行情({commodity_id or 'TX'})")
     grids = parse_all_table_grids(resp.text)
 
     for grid in grids:
@@ -518,7 +526,7 @@ def build_today_row():
     逐項抓取，單一項目失敗不影響其他項目：失敗的欄位填 None，並在 errors
     清單記錄原因，最後印出來讓你知道哪些要人工補或延後重跑。
     """
-    today = dt.date.today()
+    today = _today()
     row = {col: None for col in COLUMNS}
     row["日期"] = today.strftime("%Y-%m-%d")
     errors = []
@@ -586,23 +594,46 @@ def build_today_row():
 
 
 def append_to_history(row, path=HISTORY_CSV):
-    file_exists = os.path.exists(path)
-    if file_exists:
+    """
+    把今天這一列寫進 history.csv：
+      - 日期還不存在 -> 新增一列
+      - 日期已存在   -> 只補上原本空白、這次有抓到的欄位（已有的值不覆蓋）。
+        這樣某次執行因為連線逾時少抓幾欄時，重跑一次就能補齊，不用手動刪列。
+    每次都把整個檔案重新寫出：換行一律是 CRLF、去掉空白列，就算檔案在 GitHub
+    網頁上手動編輯過（換行混用、結尾沒換行），也不會讓新的一列黏到上一列後面。
+    """
+    rows = []
+    if os.path.exists(path):
         with open(path, newline="", encoding="utf-8-sig") as f:
-            existing_dates = {r["日期"] for r in csv.DictReader(f)}
-        if row["日期"] in existing_dates:
-            print(f"{row['日期']} 已存在，略過寫入。")
+            rows = [r for r in csv.DictReader(f) if (r.get("日期") or "").strip()]
+
+    existing = next((r for r in rows if r["日期"].strip() == row["日期"]), None)
+    if existing is None:
+        rows.append(row)
+        print(f"新增 {row['日期']} 的資料到 {path}")
+    else:
+        filled = [
+            col for col in COLUMNS
+            if col != "日期"
+            and not str(existing.get(col) or "").strip()
+            and row.get(col) is not None
+        ]
+        if not filled:
+            print(f"{row['日期']} 已存在，沒有需要補上的空白欄位。")
             return
-    with open(path, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUMNS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
-    print(f"已寫入 {row['日期']} 的資料到 {path}")
+        for col in filled:
+            existing[col] = row[col]
+        print(f"{row['日期']} 已存在，補上空白欄位：{'、'.join(filled)}")
+
+    # 不寫 BOM：前端 PapaParse 會把 BOM 當成第一個欄位名稱的一部分，讀不到「日期」
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main():
-    today = dt.date.today()
+    today = _today()
     force = os.environ.get("FORCE_RUN", "").strip().lower() in ("1", "true", "yes")
     closed, reason = is_market_closed(today)
     if closed and not force:
@@ -620,6 +651,11 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     print(row)
+    if all(row[col] is None for col in COLUMNS if col != "日期"):
+        # 一個欄位都沒抓到（例如休市或資料還沒公布）就不要寫入只有日期的空白列，
+        # 並讓這次執行算失敗，方便在 GitHub Actions 發現。
+        print("所有欄位都沒有抓到今天的資料，不寫入 history.csv。")
+        sys.exit(1)
     append_to_history(row)
 
 
