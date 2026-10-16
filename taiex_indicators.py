@@ -29,6 +29,9 @@
        - 三大法人找不到對應項目時改為失敗（留空），不再預設填 0
        - 「今天」一律用台灣時間計算，手動執行時也不會跨日算錯
        - 同一天重跑時，只補上之前沒抓到的空白欄位（不用再手動刪列）
+  v3 2026-10-16 期交所頁面連線逾時造成欄位空白：連線逾時/錯誤時自動重試 3 次，
+     逾時秒數由 20 秒放寬為 30 秒。
+     重跑時「投信」改以最新數字為準（證交所公布後會修正）。
 
 執行需要的套件：requests、pandas、lxml、beautifulsoup4
   （pip install requests pandas lxml beautifulsoup4）
@@ -48,6 +51,7 @@ import io
 import os
 import re
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -60,7 +64,8 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     )
 }
-TIMEOUT = 20
+TIMEOUT = 30
+RETRIES = 3
 HISTORY_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.csv")
 
 COLUMNS = [
@@ -68,6 +73,10 @@ COLUMNS = [
     "前五大交易人留倉", "前十大交易人留倉", "選PCR", "外(選)",
     "韭菜指數", "未平倉口數",
 ]
+
+# 同一天重跑時「以最新抓到的數字為準」的欄位（其他欄位只補空白、不覆蓋）。
+# 證交所的投信買賣超在公布後會再修正（例如 2026-10-16：117.5 -> 110.5 億）。
+OVERWRITE_COLUMNS = {"投信"}
 
 
 # --------------------------------------------------------------------------
@@ -89,7 +98,23 @@ def _to_number(text):
 
 
 def _get(url, params=None):
-    resp = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
+    """
+    期交所網站在 GitHub Actions 上常常「Read timed out」（實測幾乎每天都有一兩個
+    頁面逾時，造成該欄位空白），所以連線逾時、連線錯誤、伺服器 5xx 錯誤時
+    最多重試 RETRIES 次，每次間隔逐漸拉長。
+    """
+    for attempt in range(1, RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
+            if resp.status_code >= 500:
+                resp.raise_for_status()
+            break
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+            if attempt == RETRIES:
+                raise
+            wait = 5 * attempt
+            print(f"  -> 第 {attempt} 次連線失敗（{e}），{wait} 秒後重試...")
+            time.sleep(wait)
     resp.raise_for_status()
     return resp
 
@@ -599,6 +624,7 @@ def append_to_history(row, path=HISTORY_CSV):
       - 日期還不存在 -> 新增一列
       - 日期已存在   -> 只補上原本空白、這次有抓到的欄位（已有的值不覆蓋）。
         這樣某次執行因為連線逾時少抓幾欄時，重跑一次就能補齊，不用手動刪列。
+        例外：OVERWRITE_COLUMNS 裡的欄位只要這次有抓到，就更新成最新數字。
     每次都把整個檔案重新寫出：換行一律是 CRLF、去掉空白列，就算檔案在 GitHub
     網頁上手動編輯過（換行混用、結尾沒換行），也不會讓新的一列黏到上一列後面。
     """
@@ -612,18 +638,25 @@ def append_to_history(row, path=HISTORY_CSV):
         rows.append(row)
         print(f"新增 {row['日期']} 的資料到 {path}")
     else:
-        filled = [
-            col for col in COLUMNS
-            if col != "日期"
-            and not str(existing.get(col) or "").strip()
-            and row.get(col) is not None
-        ]
-        if not filled:
-            print(f"{row['日期']} 已存在，沒有需要補上的空白欄位。")
-            return
-        for col in filled:
+        filled, updated = [], []
+        for col in COLUMNS:
+            if col == "日期" or row.get(col) is None:
+                continue
+            old = str(existing.get(col) or "").strip()
+            if not old:
+                filled.append(col)
+            elif col in OVERWRITE_COLUMNS and old != str(row[col]):
+                updated.append(f"{col} {old} -> {row[col]}")
+            else:
+                continue
             existing[col] = row[col]
-        print(f"{row['日期']} 已存在，補上空白欄位：{'、'.join(filled)}")
+        if not filled and not updated:
+            print(f"{row['日期']} 已存在，沒有需要補上或更新的欄位。")
+            return
+        if filled:
+            print(f"{row['日期']} 已存在，補上空白欄位：{'、'.join(filled)}")
+        if updated:
+            print(f"{row['日期']} 已存在，更新為最新數字：{'、'.join(updated)}")
 
     # 不寫 BOM：前端 PapaParse 會把 BOM 當成第一個欄位名稱的一部分，讀不到「日期」
     with open(path, "w", newline="", encoding="utf-8") as f:

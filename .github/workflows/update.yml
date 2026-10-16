@@ -24,6 +24,10 @@ jobs:
     steps:
       - name: 取得倉庫程式碼
         uses: actions/checkout@v4
+        with:
+          # 一律取最新的 main。不指定的話，在 Actions 頁面按「Re-run」時會用
+          # 當初那次執行的舊版本，history.csv 看不到後來已寫入的資料，推送時就會衝突。
+          ref: main
 
       - name: 設定 Python
         uses: actions/setup-python@v5
@@ -39,21 +43,29 @@ jobs:
         run: python taiex_indicators.py
 
       - name: 把新資料寫回倉庫
+        env:
+          FORCE_RUN: ${{ inputs.force }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add history.csv
-          if git diff --cached --quiet; then
-            echo "沒有新資料需要提交"
-            exit 0
-          fi
-          git commit -m "自動更新 $(date +'%Y-%m-%d')"
           for i in 1 2 3 4 5; do
-            if git pull --rebase origin main && git push; then
+            git add history.csv
+            if git diff --cached --quiet; then
+              echo "沒有新資料需要提交"
               exit 0
             fi
-            echo "推送失敗，準備第 $((i + 1)) 次嘗試..."
+            git commit -q -m "自動更新 $(TZ=Asia/Taipei date +'%Y-%m-%d')"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            # main 在這段期間有了新的提交（例如另一次執行也寫入了今天的資料）。
+            # 不用 git pull --rebase 硬合併 CSV（同一列兩邊都改會衝突），而是改以
+            # 最新的 main 為基準重新執行一次：程式只會補上還空白的欄位。
+            echo "推送失敗，改以最新 main 為基準重新抓取，準備第 $((i + 1)) 次嘗試..."
             sleep $((RANDOM % 10 + 5))
+            git fetch -q origin main
+            git reset -q --hard origin/main
+            python taiex_indicators.py || true
           done
           echo "多次重試後仍然推送失敗"
           exit 1
