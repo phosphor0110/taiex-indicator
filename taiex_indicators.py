@@ -32,6 +32,11 @@
   v3 2026-10-16 期交所頁面連線逾時造成欄位空白：連線逾時/錯誤時自動重試 3 次，
      逾時秒數由 20 秒放寬為 30 秒。
      重跑時「投信」改以最新數字為準（證交所公布後會修正）。
+  v4 2026-11-09 的排程被 GitHub 延遲到台灣時間 11-10 凌晨 00:01 才跑，程式把
+     「今天」當成 11-10，資料全部對不上而整天漏抓。已修正為：
+       - 台灣時間下午 2 點前執行時，改抓「前一個交易日」的資料
+       - 證交所、期交所全部改用「指定日期」查詢，不再依賴網站預設的最新一天
+       - 可用環境變數 TARGET_DATE=YYYY-MM-DD 指定要補抓的日期
 
 執行需要的套件：requests、pandas、lxml、beautifulsoup4
   （pip install requests pandas lxml beautifulsoup4）
@@ -66,6 +71,9 @@ HEADERS = {
 }
 TIMEOUT = 30
 RETRIES = 3
+# 台灣時間這個整點之前執行時，當天的資料還沒公布，改抓前一個交易日。
+# GitHub 排程常常延遲好幾個小時，偶爾會拖過半夜 12 點，靠這個才不會整天漏抓。
+DATA_READY_HOUR = 14
 HISTORY_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.csv")
 
 COLUMNS = [
@@ -97,15 +105,19 @@ def _to_number(text):
         return None
 
 
-def _get(url, params=None):
+def _get(url, params=None, data=None):
     """
     期交所網站在 GitHub Actions 上常常「Read timed out」（實測幾乎每天都有一兩個
     頁面逾時，造成該欄位空白），所以連線逾時、連線錯誤、伺服器 5xx 錯誤時
     最多重試 RETRIES 次，每次間隔逐漸拉長。
+    有傳 data 時改用 POST（期交所要用表單 POST 才能指定查詢日期）。
     """
     for attempt in range(1, RETRIES + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
+            if data is not None:
+                resp = requests.post(url, headers=HEADERS, params=params, data=data, timeout=TIMEOUT)
+            else:
+                resp = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
             if resp.status_code >= 500:
                 resp.raise_for_status()
             break
@@ -124,35 +136,53 @@ def _clean(text):
     return re.sub(r"\s+", "", text or "")
 
 
+def _now_tw():
+    return dt.datetime.now(ZoneInfo("Asia/Taipei"))
+
+
 def _today():
     """台灣時間的今天。GitHub Actions 主機是 UTC，手動在台灣早上 8 點前執行會差一天。"""
-    return dt.datetime.now(ZoneInfo("Asia/Taipei")).date()
+    return _now_tw().date()
+
+
+# 這次要抓哪一天的資料，由 main() 用 resolve_data_date() 決定後設定
+_DATA_DATE = None
+
+
+def _data_date():
+    return _DATA_DATE or _today()
+
+
+def _taifex_date():
+    """期交所查詢表單用的日期格式，例如 2026/11/09。"""
+    return _data_date().strftime("%Y/%m/%d")
 
 
 def _check_taifex_date(html, page_name):
     """
-    確認期交所頁面上的資料日期就是今天，不是的話就報錯（該欄位留空）。
+    確認期交所頁面上的資料日期就是要抓的那一天，不是的話就報錯（該欄位留空）。
 
-    期交所這些網址沒帶日期參數時，會回傳「最新已公布的那一天」：休市日或
-    當天資料還沒公布時，拿到的其實是前一個交易日的數字。實測每個頁面裡
-    第一個出現的 YYYY/M/D 日期就是資料日期（PCR 頁則是最新一筆資料列）。
+    現在都有指定查詢日期，但期交所查不到那天（休市、還沒公布）時可能回傳別天
+    或空表，所以仍然核對一次。實測每個頁面裡第一個出現的 YYYY/M/D 日期就是
+    資料日期（PCR 頁則是最新一筆資料列）。
     """
     m = re.search(r"(20\d{2})/(\d{1,2})/(\d{1,2})", html)
     if not m:
         raise RuntimeError(f"{page_name} 頁面找不到資料日期，網站可能已經改版")
     page_date = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    if page_date != _today():
+    if page_date != _data_date():
         raise RuntimeError(
-            f"{page_name} 目前的資料日期是 {page_date}，不是今天（今天的資料可能還沒公布），不採用"
+            f"{page_name} 回傳的資料日期是 {page_date}，不是要抓的 {_data_date()}"
+            "（資料可能還沒公布），不採用"
         )
 
 
 def _check_twse_json(data, page_name):
-    """證交所查無資料時 stat 不是 OK；有資料時 date 欄位是 YYYYMMDD，要等於今天。"""
+    """證交所查無資料時 stat 不是 OK；有資料時 date 欄位是 YYYYMMDD，要等於要抓的那天。"""
     if str(data.get("stat", "")).upper() != "OK":
-        raise RuntimeError(f"{page_name} 查無今天資料（{data.get('stat')}）")
-    if data.get("date") and data["date"] != _today().strftime("%Y%m%d"):
-        raise RuntimeError(f"{page_name} 回傳的資料日期是 {data['date']}，不是今天，不採用")
+        raise RuntimeError(f"{page_name} 查無 {_data_date()} 的資料（{data.get('stat')}）")
+    if data.get("date") and data["date"] != _data_date().strftime("%Y%m%d"):
+        raise RuntimeError(f"{page_name} 回傳的資料日期是 {data['date']}，不是要抓的 {_data_date()}，不採用")
 
 
 def parse_table_grid(html):
@@ -234,7 +264,7 @@ def fetch_twse_volume():
     """證交所每日成交量統計，取『總計(1~15)』成交金額(元)。"""
     url = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
     # TWSE 的 rwd JSON API 比原本的 HTML 頁面更穩定，直接查當日
-    today = _today().strftime("%Y%m%d")
+    today = _data_date().strftime("%Y%m%d")
     resp = _get(url, params={"date": today, "type": "ALL", "response": "json"})
     data = resp.json()
     _check_twse_json(data, "TWSE 成交量")
@@ -254,7 +284,7 @@ def fetch_twse_volume():
 def fetch_twse_institutional():
     """回傳 dict：外資、投信、自營（自行+避險合計），單位：元。"""
     url = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
-    today = _today().strftime("%Y%m%d")
+    today = _data_date().strftime("%Y%m%d")
     resp = _get(url, params={"dayDate": today, "type": "day", "response": "json"})
     data = resp.json()
     _check_twse_json(data, "TWSE 三大法人")
@@ -300,7 +330,7 @@ def fetch_taifex_futures_positions():
     11口數未平倉空方 12契約金額未平倉空方 13口數未平倉淨額 14契約金額未平倉淨額
     """
     url = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
-    resp = _get(url)
+    resp = _get(url, data={"queryType": "1", "queryDate": _taifex_date()})
     _check_taifex_date(resp.text, "期交所三大法人期貨")
     grid = parse_table_grid(resp.text)
     records = []
@@ -359,8 +389,9 @@ def fetch_taifex_large_trader():
     4前十大買方部位數 5前十大買方百分比 6前五大賣方部位數 7前五大賣方百分比
     8前十大賣方部位數 9前十大賣方百分比 10全市場未沖銷部位數
     """
-    url = "https://www.taifex.com.tw/cht/3/largeTraderFutQryTbl"
-    resp = _get(url)
+    # largeTraderFutQryTbl 不吃日期參數，要指定日期得用查詢頁 largeTraderFutQry
+    url = "https://www.taifex.com.tw/cht/3/largeTraderFutQry"
+    resp = _get(url, data={"queryDate": _taifex_date(), "contractId": "all"})
     _check_taifex_date(resp.text, "期交所大額交易人")
     grid = parse_table_grid(resp.text)
     for row in grid:
@@ -392,7 +423,7 @@ def fetch_taifex_pcr():
     不依賴固定的列號（表頭有沒有被 pandas 正確跳過並不影響這裡）。
     """
     url = "https://www.taifex.com.tw/cht/3/pcRatioExcel"
-    resp = _get(url)
+    resp = _get(url, data={"queryStartDate": _taifex_date(), "queryEndDate": _taifex_date()})
     _check_taifex_date(resp.text, "期交所選擇權 PCR")
     grid = parse_table_grid(resp.text)
     date_pattern = re.compile(r"^\d{4}/\d{1,2}/\d{1,2}$")
@@ -419,7 +450,7 @@ def fetch_taifex_options_institutional():
         或是把這個欄位獨立成另一個排程，晚一天寫入。
     """
     url = "https://www.taifex.com.tw/cht/3/callsAndPutsDateExcel"
-    resp = _get(url)
+    resp = _get(url, data={"queryType": "1", "queryDate": _taifex_date()})
     _check_taifex_date(resp.text, "期交所法人選擇權")
     grid = parse_table_grid(resp.text)
     # 欄位順序：0序號 1商品名稱 2權別 3身份別 ... 最後一欄(-1)=未平倉買賣差額契約金額
@@ -462,8 +493,7 @@ def fetch_taifex_daily_market(commodity_id=None):
     欄位位置用表頭比對，不寫死固定欄號。
     """
     url = "https://www.taifex.com.tw/cht/3/futDailyMarketExcel"
-    params = {"commodity_id": commodity_id} if commodity_id else {}
-    resp = _get(url, params=params)
+    resp = _get(url, data={"queryDate": _taifex_date(), "commodity_id": commodity_id or "TX"})
     _check_taifex_date(resp.text, f"期交所每日行情({commodity_id or 'TX'})")
     grids = parse_all_table_grids(resp.text)
 
@@ -551,7 +581,7 @@ def build_today_row():
     逐項抓取，單一項目失敗不影響其他項目：失敗的欄位填 None，並在 errors
     清單記錄原因，最後印出來讓你知道哪些要人工補或延後重跑。
     """
-    today = _today()
+    today = _data_date()
     row = {col: None for col in COLUMNS}
     row["日期"] = today.strftime("%Y-%m-%d")
     errors = []
@@ -665,8 +695,45 @@ def append_to_history(row, path=HISTORY_CSV):
         writer.writerows(rows)
 
 
+def resolve_data_date():
+    """
+    決定這次要抓哪一天的資料：
+      1. 有設環境變數 TARGET_DATE（YYYY-MM-DD）就用它，方便手動補抓某一天。
+      2. 台灣時間下午 2 點（DATA_READY_HOUR）以後執行 -> 抓今天。
+      3. 下午 2 點以前執行 -> 抓前一個交易日。GitHub 排程常延遲好幾小時，
+         例如 2026-11-09 的排程拖到 11-10 凌晨 00:01 才跑，以前會誤抓 11-10
+         而全部落空；現在會正確抓 11-09。（白天手動執行也一樣，當天資料
+         還沒公布，抓前一個交易日才有意義；已有的值只會補空白，不會亂蓋。）
+    """
+    raw = os.environ.get("TARGET_DATE", "").strip()
+    if raw:
+        try:
+            return dt.date.fromisoformat(raw), "手動指定 TARGET_DATE"
+        except ValueError:
+            print(f"TARGET_DATE 格式錯誤（{raw}），應為 YYYY-MM-DD")
+            sys.exit(1)
+    now = _now_tw()
+    if now.hour >= DATA_READY_HOUR:
+        return now.date(), "今天"
+    day = now.date()
+    for _ in range(15):
+        day -= dt.timedelta(days=1)
+        closed, _reason = is_market_closed(day)
+        if not closed:
+            return day, f"台灣時間 {now:%H:%M}，今天資料尚未公布，改抓前一個交易日"
+    print("往前 15 天都找不到交易日，休市日曆可能有問題")
+    sys.exit(1)
+
+
 def main():
-    today = _today()
+    global _DATA_DATE
+    today, why = resolve_data_date()
+    _DATA_DATE = today
+    print(f"本次抓取日期：{today}（{why}）")
+    if os.environ.get("GITHUB_ENV"):
+        # 讓 workflow 後面的步驟知道抓的是哪天（commit 訊息、推送失敗重抓時用）
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+            f.write(f"DATA_DATE={today.isoformat()}\n")
     force = os.environ.get("FORCE_RUN", "").strip().lower() in ("1", "true", "yes")
     closed, reason = is_market_closed(today)
     if closed and not force:
@@ -687,7 +754,7 @@ def main():
     if all(row[col] is None for col in COLUMNS if col != "日期"):
         # 一個欄位都沒抓到（例如休市或資料還沒公布）就不要寫入只有日期的空白列，
         # 並讓這次執行算失敗，方便在 GitHub Actions 發現。
-        print("所有欄位都沒有抓到今天的資料，不寫入 history.csv。")
+        print(f"所有欄位都沒有抓到 {today} 的資料，不寫入 history.csv。")
         sys.exit(1)
     append_to_history(row)
 

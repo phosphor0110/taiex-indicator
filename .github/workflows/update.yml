@@ -10,6 +10,11 @@ on:
         description: '休市日也強制執行（測試用）'
         type: boolean
         default: false
+      date:
+        description: '補抓指定日期（YYYY-MM-DD，留空＝自動判斷：下午 2 點前抓前一個交易日，之後抓今天）'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -40,11 +45,13 @@ jobs:
       - name: 執行抓取與計算（休市日會自動略過）
         env:
           FORCE_RUN: ${{ inputs.force }}
+          TARGET_DATE: ${{ inputs.date }}
         run: python taiex_indicators.py
 
       - name: 把新資料寫回倉庫
         env:
           FORCE_RUN: ${{ inputs.force }}
+          TARGET_DATE: ${{ inputs.date }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -54,7 +61,7 @@ jobs:
               echo "沒有新資料需要提交"
               exit 0
             fi
-            git commit -q -m "自動更新 $(TZ=Asia/Taipei date +'%Y-%m-%d')"
+            git commit -q -m "自動更新 ${DATA_DATE:-$(TZ=Asia/Taipei date +'%Y-%m-%d')}"
             if git push origin HEAD:main; then
               exit 0
             fi
@@ -65,7 +72,8 @@ jobs:
             sleep $((RANDOM % 10 + 5))
             git fetch -q origin main
             git reset -q --hard origin/main
-            python taiex_indicators.py || true
+            # 重抓時固定同一天（DATA_DATE 由上一步的 Python 程式寫入）
+            TARGET_DATE="${DATA_DATE:-$TARGET_DATE}" python taiex_indicators.py || true
           done
           echo "多次重試後仍然推送失敗"
           exit 1
